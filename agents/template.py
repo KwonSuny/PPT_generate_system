@@ -1,167 +1,154 @@
 import json
+from typing import Optional
 from config.schema import PPTFinalBlueprint
-from config.sanitizers import normalize_blueprint_payload, parse_json_object
+from config.content import ContentConstraintError, bind_canvas, content_values
+from config.sanitizers import normalize_blueprint_payload, parse_completion_payload, FONT_SCALE_STEPS
 from config.state import PPTGenerationState
-from config.llm_client import create_client, chat_completion_with_retry
+from config.llm_client import create_client, chat_completion_with_retry, resolve_model_name, model_request_options
 
 
-def get_layout_agent(api_key: str, model_name: str = "qwen3.8-max"):
-    """
-    创建并返回一个精通数字化网格排版与高级原件堆叠的画布物理精算智能体。
-    """
+def _strip_internal_fields(payload):
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = {key: value for key, value in payload.items() if key not in {"layout_feedback", "capacity_budget"}}
+    cleaned["slides"] = [{k: v for k, v in slide.items() if k != "image_prompt"} for slide in payload.get("slides", [])]
+    return cleaned
+
+
+def select_layout_canvases(payload, slides, state=None):
+    """页 ID 明确时按请求范围选取，不能把整套生成指令扩成额外页面。"""
+    canvases = payload.get("canvases", [])
+    expected_ids = [slide.get("id") for slide in slides]
+    returned_ids = [canvas.get("slide_id") for canvas in canvases]
+    if expected_ids and all(expected_ids) and len(set(expected_ids)) == len(expected_ids):
+        if returned_ids and all(isinstance(value, str) and value for value in returned_ids):
+            if len(set(returned_ids)) != len(returned_ids):
+                raise ContentConstraintError("Layout 返回重复页 ID，无法安全对应请求页面")
+            indexed = dict(zip(returned_ids, canvases))
+            if all(value in indexed for value in expected_ids):
+                if len(canvases) > len(slides) and state:
+                    state.append_progress(f"Layout: 按页 ID 匹配本次 {len(slides)} 页，忽略 {len(canvases) - len(slides)} 张范围外画布")
+                return {**payload, "canvases": [indexed[value] for value in expected_ids]}
+            raise ContentConstraintError("Layout 未返回请求的页 ID：" + "、".join(value for value in expected_ids if value not in indexed))
+        if any(returned_ids):
+            raise ContentConstraintError("Layout 返回的页 ID 不完整，无法安全对应请求页面")
+    if len(canvases) != len(slides):
+        raise ContentConstraintError(f"Layout 本次输入 {len(slides)} 页、返回 {len(canvases)} 张画布，且缺少可唯一匹配的页 ID")
+    return payload
+
+
+def composition_guidance(slide):
+    """根据已有语义选择构图候选，不预填文案、不绑定固定坐标。"""
+    kind = slide.get("layout_type")
+    points = slide.get("full_content") or []
+    count = len(points)
+    has_art = bool(slide.get("svg_code") or slide.get("image_path"))
+    if kind == "title_page":
+        candidates = ["标题与结论居中留白"]
+        if has_art:
+            candidates = ["左侧标题与结论、右侧独立主题图", "上方标题、下方横向主题图"]
+    elif slide.get("table"):
+        candidates = ["标题与结论之下放通栏表格", "表格为主、独立图解为辅的左右构图"] if has_art else ["标题与结论之下放通栏表格"]
+    elif slide.get("diagram"):
+        candidates = ["上方关系图、下方对应的解释列", "左侧关系图、右侧短说明"]
+        if count > 3:
+            candidates.insert(0, "上方关系图、下方二列解释")
+    elif has_art:
+        candidates = ["左侧分层文案、右侧独立图示", "上方宽幅图示、下方对应解释列"]
+    elif count >= 3:
+        candidates = ["二列分层要点", "三列短说明" if count == 3 else "二列二行分层要点"]
+    else:
+        candidates = ["一条清晰阅读轴上的分层说明", "留白充足的左右对照"]
+    table = slide.get("table") or {}
+    return {"candidates": candidates, "text_blocks": count,
+            "table_rows": len(table.get("rows") or []), "table_columns": len(table.get("columns") or []),
+            "art_is_separate": has_art,
+            "selection_rule": "按内容长度、图示比例和用户风格选一种，必要时自由调整；候选不是必须填满的固定模板。"}
+
+
+def get_layout_agent(api_key: str, model_name: Optional[str] = None):
+    model_name = model_name or resolve_model_name("layout")
     client = create_client(api_key)
-    
+
     def design_layout(state: PPTGenerationState, writer_output_json: dict) -> PPTFinalBlueprint:
-        print(" [Layout Agent] 感知单页配色、微图标与图片路径，开始进行排版")
-        
-        if isinstance(writer_output_json, dict):
-            input_str = json.dumps(writer_output_json, ensure_ascii=False, indent=2)
-        else:
-            input_str = str(writer_output_json)
-
+        from config.icon_library import available_icons
+        lean = _strip_internal_fields(writer_output_json)
+        for slide in lean.get("slides", []):
+            slide["content_catalog"] = content_values(slide)
+            slide["composition_guidance"] = composition_guidance(slide)
         system_prompt = """
-        # ROLE
-        你是一个精通数字化网格排版系统（Grid System）和高端幻灯片版式的顶尖视觉总监。
-        你的任务是：将输入的包含独立配色、专属图标序列以及本地点缀图片路径的“语义大纲”彻底转化为完全确定且多样布局的“物理画布蓝图（JSON 对象）”。
-
-        # CANVAS SPECIFICATION (画布物理参数)
-        - 画布大小固定为标准的 16:9 宽屏：宽度 = 13.333 英寸，高度 = 7.5 英寸。
-        - 所有的物理图元坐标 (`left`, `top`, `width`, `height`) 必须基于此范围精算，单位为浮点数（英寸）。
-
-        #  STRICT SCHEMA LIMITATIONS (绝对不可逾越的类型红线) 
-        1. 你的物理蓝图数据必须 100% 完美对齐 Pydantic 校验器，严禁自行发明或简化任何字段值！
-        2. 必须保留原有的数据(如图片、表格等)，除非无法排版。
-
-        # OUTPUT FORMAT SPECIFICATION (严格输出规范)
-        1. 输出必须是一个标准的 JSON 对象，其根节点必须包含且仅包含一个 `"canvases"` 键，其值为主体画布的数组（即：{"canvases": [...] }）。
-        2. 严禁将整个响应或外部结构伪装、包裹成任何形如 `{"type": "textbox"}` 的多余图元节点。你输出的是整份幻灯片的总物理蓝图。
-        3. 检查所有元素是否有遮盖，必要时进行放缩、移动或重新布局，确保所有图元都在画布范围内且不重叠。
-
-        ## 1. 【图元类型 type 绝对限制】
-        `CanvasElement` 中的 `type` 字段只能且必须是以下五个基础字符串之一：['textbox', 'shape', 'svg', 'image', 'icon']。
-        -  严禁输出 `"type": "text"`！所有的文本框、标题、正文段落必须声明为 `"type": "textbox"`。
-        -  **新增 `"type": "icon"`**：用于高档微图标点缀。当检测到输入数据中含有该页面的 `icons` 数组时，你必须在对应文本内容的左侧或上方，合理规划出一个 `type: "icon"` 的物理图元，填入对应的 `icon_name` 字符串（如 'shield', 'cpu'）并指定 `icon_color`。
-
-        ## 2. 【形状类型 shape_type 绝对限制】
-        当且仅当 `type` 为 `"shape"` 时，`shape_type` 只能且必须是以下五个基础字符串之一：['rectangle', 'rounded_rectangle', 'ellipse', 'line', 'arrow']。
-        - 严禁输出 `"shape_type": "circle"`！若需绘制正圆，声明为 `"shape_type": "ellipse"` 且确保 `width` 和 `height`完全相等。
-        -  **新增 `"shape_type": "line"`**：用于在页面大标题下方、或者多栏内容之间绘制一条精细的视觉装饰分割线（如宽 10.0，高 0.04），颜色采用 `theme.secondary`，使页面极极杂志呼吸感。
-        -  **新增 `"shape_type": "arrow"`**：用于步骤递进、历史演进或时间轴（`layout_type == 'timeline'`）的场景，充当各个内容卡片之间的物理流程流向引导箭头。箭头不能太大，防止遮挡。
-
-
-        #  VISUAL ELEMENT UPGRADE RULES (高级视觉元组件拼装规则)
-        拒绝单调粗暴的纯文字排版，你要像玩乐高一样，利用新图元进行“复合组件”的物理堆叠：
-        1. **现代高端容器卡片堆叠法**：
-           当排版多栏内容（`column`）或时间轴（`timeline`）时，不要干巴巴地放字。应当先画一个浅色或带有边框的圆角矩形作为容器底衬 (`type="shape", shape_type="rounded_rectangle", fill_color=微亮背景色`)，然后在这块物理区域内部，精准重叠计算并摆放：一个 `type="icon"` 图标组件 + 一个带有精美标题和正文的 `type="textbox"`。
-        2. **图标与文本框的物理网格对齐（对齐铁律）**：
-           - **左右并排对齐**：若图标放在文字左侧，紧挨着它的文本框必须预留至少 0.2 英寸呼吸间距，且文本框的 `top` 应与图标物理居中对齐。
-           - **上下堆叠对齐**：若图标放在文字上方，则下方的文本框必须预留至少 0.6 英寸呼吸间距。
-        3. **SVG / 复杂表格图元空间精算铁律**：
-           - 当检测到该幻灯片包含已生成的 `svg_code`（如表格或高级拓扑图）时，必须在画布中规划一个核心的 `type: "svg"` 物理图元。
-           - 必须为该表格/图形组件开辟出极其宽敞、显眼的独立黄金视区，使其成为当前全页的视觉主体。
-           - 必须精准计算它与上方的页面小标题框（`textbox`）的位置边界，确保留有至少 0.2 英寸的绝对空气空隙，彻底杜绝任何层级重叠。
-           - 必须按比例缩放 SVG 。
-        # LAYOUT RULES (排版精算规则)
-        - 保持原有的多栏算框、正文页2/3安全网格“侧边点缀排版法”等业务逻辑。
-        - **单页配色 (`theme`)**: 每一个 slide 都带有一个独一无二的 `theme`。你必须将 `theme.background` 作为该页 `SlideCanvas` 的 `background_color`，并将相应的颜色分发给各个文本框的 `font_color`、图标的 `icon_color` 或形状的 `fill_color`、`line_color`。
-        - 所有图元必须严格落在 13.333 x 7.5 英寸画布内，禁止负坐标、禁止超出右边界或下边界，元素之间至少保留 0.1 英寸安全距离。
-        - `image` 只代表美观插图/点缀图，不是背景图。严禁将 image 铺满全屏或作为文字衬底。
-        - image 必须使用侧边栏、角落或独立视觉区；不要穿过正文列或覆盖标题。
-
-        # READABILITY AND IMAGE RULES (可读性与图片比例规则)
-        - 文本与背景的对比度必须足够高：浅色背景使用 #111827/#334155 等深色文字；深色背景使用 #FFFFFF/#E5E7EB 等浅色文字。
-        - 标题框高度不得低于 0.65 英寸，正文段落框高度不得低于 0.45 英寸；多行正文必须预留上下内边距，不要让文字贴边。
-        - 任何 image 图元都必须保持原始宽高比，按 contain 思路放入插图区。
-
-        # TEXTBOX PARAGRAPH RULES (文本框段落规范)
-        1. 严禁将任何 type == "textbox" 的元素的 "paragraphs" 字段设为 null！
-        2. 你在对当前页面进行排版布控算框时，必须把输入数据中当前页面的 `title`、`punchline` 或 `full_content` 中的每一条文本，原汁原味地转换成符合 `TextParagraph` Schema 的结构，填入对应 textbox 的 paragraphs 列表中！
-        """
-
-        mode_hint = ""
-        if state.operation_mode == "incremental_page":
-            pages_desc = state.page_label()
-            mode_hint = (
-                f"本次为针对 {pages_desc} 的单页增量排版：输入 JSON 只包含目标页内容。"
-                "你输出的 canvases 数组长度必须严格等于 1（仅该页的物理画布），严禁输出多页。"
-                "配色需与输入中的 neighbor_themes（邻页配色）保持同一色彩家族的连续演进。"
-            )
-        elif state.operation_mode == "continue":
-            mode_hint = "你将基于现有 PPT 继续优化视觉布局，不要完全重置页面结构。"
-        elif state.operation_mode == "modify_text":
-            mode_hint = "本轮仅调整文本内容，视觉排版尽量保持当前布局。"
-        elif state.operation_mode == "modify_design":
-            mode_hint = "本轮仅优化视觉风格与排版细节，不要更改核心文本。"
-        if state.modify_page is not None and state.operation_mode not in ("incremental_page",):
-            mode_hint += f" 重点聚焦第 {state.modify_page} 页。"
-
-        # 单页输入约束：无论何种 operation_mode（含全量管线逐页排版时 mode 仍为 new/continue），
-        # 只要本次输入仅含 1 页内容，就必须要求输出严格 1 个画布，防止模型对单页输入误输出多页。
-        input_slides = (writer_output_json or {}).get("slides") if isinstance(writer_output_json, dict) else None
-        if isinstance(input_slides, list) and len(input_slides) == 1:
-            single_hint = (
-                "本次输入仅包含 1 页内容，你输出的 canvases 数组长度必须严格等于 1"
-                "（仅该页的物理画布），严禁输出多页。"
-            )
-            mode_hint = f"{mode_hint} {single_hint}".strip()
-
+<role>
+你是演示文稿艺术指导与信息排版师。你负责把内容转成清晰、有节奏、有主题辨识度的页面，而不是逐条往卡片里填文字。
+</role>
+<task>
+你将语义内容排成 16:9 演示文稿，画布 13.333×7.5 英寸。只输出 JSON：schema_version=2、canvases。
+每个画布有 slide_id、background_color、elements。输入一页时输出严格一个画布。
+尊重用户风格，其次根据主题用途判断，未明确时采用简洁汇报。使用平面构图、清晰标题和信息层次，无须反复使用卡片或渐变。
+存在 design_direction 时执行其构图方向与用户要求，只改变本次目标页，不改语义。layout_policy.allow_theme_change=true 时可改变背景和字体配色，否则沿用主题色族。用户明确要求优先于原版和邻页，主题统一不等于每页背景完全相同。
+</task>
+<creative_direction>
+根据语义选择有主次的视觉构图：大字结论、侧边色面、分层流程、非等宽对照、宽幅时间轴或图文分区。背景、标题和重点文字共同服务叙事；可用主题深色底、浅色底、局部强调色面与克制的几何形状，不能把每页都做成白底蓝色标题加三列长正文。
+选择一个主要视觉动作，周围内容保持安静。允许不对称、明显留白与不同字号层级；不要无意义装饰、全页纹理或把图示缩成角落小图。
+深底使用浅色正文及清晰强调色，浅底使用深色正文；白底上的深色面板需要浅色面板文字，不能只看整页背景颜色。SVG内部颜色锁定时，可放到独立浅色承托区域。
+标题常用28–40pt，结论18–24pt，正文18–24pt；可在提供的字号下限内缩放并重新测算高度。font_family可选择 Microsoft YaHei、DengXian、SimHei、SimSun、Segoe UI；同页最多两种字体，按主题选择而非随意混用。
+同一页一个内容引用显示一次即可；不要用侧边大字再重复结论。必须展示 required_content_refs 中的原版独有文字引用。
+</creative_direction>
+<geometry_and_capacity>
+所有 icon 必须指定本页文字 content_ref，且图标位于对应文本左侧，中心对齐、间距 0.2in，尺寸 0.3–0.5in。优先使用 icon_suggestions；不要用 circle 或编造名称代替图标。不要给同一段落重复配图标。
+capacity_budget 在首次请求前按原文计算文字高度、图标留白与可行构图。先读取预算再分配空间；参考坐标可以重设计，但必须保留所需高度。列间有图标时至少预留图标宽度+0.2in文字间距+0.28in相邻板块间距，不能让下一列图标挤入上一列的文字。
+先根据 composition_guidance 选择阅读顺序与主视觉，再安排容器。大标题、结论、说明有明确层级；整套保留统一标题基线、正文左沿与主题色族，但按语义切换构图。
+参考原则：上图下说明时图中模块与下方列对应；左右图文时图示独占区域；对比信息成列且同级标题对齐。四条解释可采用二列二行；若预算提示这会压缩主图高度，使用四列短说明或切换分区，避免重复标题加长段落形成满页列表。
+图标是信息锚点：只在能表达对应语义时使用，贴齐对应标题，禁止为每条要点堆放无意义圆圈。主题图优先保持完整比例和留白，不加全页装饰背景。
+图元类型：textbox、shape、icon、image、svg、table、diagram。每个图元包含唯一 id 和 left/top/width/height（英寸）。
+textbox.paragraphs 每段包含 content_ref、text、font_size、font_color、bold、alignment、space_after。
+content_ref 必须逐字取自 content_catalog，例如 title、punchline、full_content/point-1；程序用引用回填原文，不能改写内容或省略数字。
+正文优先 18/20pt，标题 32/40pt，注释 12/14pt。容器按实际中文字数和换行计算容量；允许缩放时须遵守字号下限并重新检查换行，不得缩成不可读的小字。
+文本框上下内边距合计 0.16in，左右合计 0.22in；行高为字号×1.22/72in。单行 20pt 文本框至少 0.51in，18pt 至少 0.48in；换行及段间距另外计入。不要把要点框设为 0.4in 后紧贴正文框。
+layout_feedback 是上一轮程序校验结果；按 required_text_heights 和字号下限重新安排整个本页的空间。先重排、再在 layout_policy 允许范围内缩放字号，正文默认至少18pt；不得新增页、删除引用或把内容改成图片。不能把首次猜测的过大字号当成永远不可降低的要求。
+layout_feedback.violations 包含全部可定位错误、元素ID、坐标、缺额；逐项消除并检查关联组，不只修改第一个报错。repeated_geometry=true 时必须更换分区或构图，不能再次提交同一组坐标。程序会重新测量并再次验证；两轮后仍失败才使用稳定布局。
+封面简洁，只放标题和副标题。其他页保留所有 full_content 和 punchline；表格/图示可与必要解释共同排版，不能遮挡。
+原生表格只规划 type=table、content_ref=table 的容器和 table_style（字号、配色）。不要重述 table 数据、改成 SVG、拆散单元格或截断行列。列宽、行高由代码计算。表格来源由代码在 table 容器底部绘制，禁止再添加重复的 table/source 文本框。
+table_style 的准确字段为 font_size、header_font_size、source_font_size、header_fill、header_color、font_color、body_fill、alternate_fill、border_color。颜色均为十六进制，不能使用 header_bg 等其它名称；背景/文字主题修改时同步更新表格，未指定时跟随当前页主题。表头字色对照 header_fill，单元格字色同时对照 body_fill 与 alternate_fill。
+关系图只规划 type=diagram、content_ref=diagram 的容器和 diagram_style（font_size、label_font_size、fill_color、font_color、line_color）。节点和连线几何由代码计算；不要另画独立箭头和节点。
+SVG 必须有一个 svg 容器，按 viewBox 保比例 contain，禁止拉伸。可以在图示下方放有引用的说明，但应留足边界与留白。
+程序只裁剪透明外边距，SVG源码由上游锁定。参考预算的 paint_size 与字体单位，令图内最小标签尽量达到10pt；不能仅因容器很宽就认为图足够大，高度仍会限制 contain 比例。若标签先天密集，优先扩大图示或换位，不删图内文字。
+图片使用输入 image_path，在独立插图区保持原始比例；不作为全文背景，不编造图注。
+shape.shape_type 仅 rectangle、rounded_rectangle、ellipse、line、arrow。关系图和流程优先原生 diagram。
+图标和文字按网格对齐，关联元素留 0.2in 间距。所有元素落在画布内，表格/图示与标题正文间至少 0.2in。
+</geometry_and_capacity>
+<output_check>
+整套保持字体层级与色族联系，允许依据页面语义切换深浅背景和构图。必须保留全部证据、来源及已生成图片，不得凭空添加未引用的正文。
+输出前核对：所有内容引用、文字所需高度、图标邻区留白、图示比例、实际文字衬底的对比度、装饰线端点。细线也须在画布内；不能以越界线段当作无关错误。
+</output_check>
+"""
+        system_prompt += "\n字号刻度：" + str(FONT_SCALE_STEPS) + "\n图标白名单：" + ", ".join(available_icons())
+        request = {"task": "只排版本次 slides；整套要求仅供理解风格，不能扩大本次页数或新增页面",
+                   "expected_slide_ids": [slide.get("id") for slide in lean.get("slides", [])],
+                   "expected_canvas_count": len(lean.get("slides", [])),
+                   "style_context": state.requirements, "layout_feedback": writer_output_json.get("layout_feedback"), "content": lean}
+        request['capacity_budget'] = writer_output_json.get('capacity_budget')
+        request['layout_policy'] = writer_output_json.get('layout_policy',{})
+        request['required_content_refs'] = writer_output_json.get('required_content_refs',[])
+        if request['layout_feedback']:
+            request['layout_feedback'] = {k:v for k,v in request['layout_feedback'].items() if k!='capacity_budget'}
+        user = json.dumps(request, ensure_ascii=False)
         state.append_progress("Layout: 生成物理蓝图")
-        # 精简上下文：Layout 只需语义大纲本身即可排版。避免把完整对话历史与
-        # current_outline/current_blueprint 重复塞入（payload 过大是此前触发
-        # 「Server disconnected without sending a response」的关键诱因）。
-        lean_messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"{mode_hint}\n\n请阅读以下语义大纲与主题色彩，并为每一页精算物理图元布局。"
-                    f"充分利用新增加的 icon、line 和 arrow 元素来丰富页面质感：\n\n{input_str}"
-                ),
-            },
-        ]
         response = chat_completion_with_retry(
-            client,
-            model=model_name,
-            messages=lean_messages,
+            client, model=model_name,
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
-            temperature=0.1,
+            **model_request_options('layout', model_name),
         )
-        
-        blueprint_json = response.choices[0].message.content.strip()
-        state.append_message("assistant", blueprint_json)
-
-        try:
-            cleaned_json = blueprint_json.strip()
-            if cleaned_json.startswith("```json"):
-                cleaned_json = cleaned_json.split("```json")[1].split("```")[0].strip()
-            elif cleaned_json.startswith("```"):
-                cleaned_json = cleaned_json.split("```")[1].split("```")[0].strip()
-                
-            parsed_data = parse_json_object(cleaned_json)
-            
-            if isinstance(parsed_data, dict) and "type" in parsed_data and "text" in parsed_data:
-                inner_content = parsed_data["text"].strip()
-                parsed_data = json.loads(inner_content)
-                
-            if isinstance(parsed_data, list):
-                parsed_data = {"canvases": parsed_data}
-                
-            parsed_data = normalize_blueprint_payload(parsed_data)
-            blueprint = PPTFinalBlueprint.model_validate(parsed_data)
-            for idx, canvas in enumerate(blueprint.canvases):
-                writer_slide = writer_output_json["slides"][idx]
-                if writer_slide.get("layout_type") == "svg":
-                    for el in canvas.elements:
-                        if el.type == "svg":
-                            el.svg_code = writer_slide.get("svg_code") 
-                            state.set("blueprint", blueprint.model_dump())
-            return blueprint
-
-        except Exception as e:
-            print(f"[Layout Agent] 尝试自动修复格式失败: {e}，将尝试原通道校验作为兜底...")
-            parsed_data = parse_json_object(blueprint_json)
-            blueprint = PPTFinalBlueprint.model_validate(normalize_blueprint_payload(parsed_data))
-            state.set("blueprint", blueprint.model_dump())
-            return blueprint
+        parsed = normalize_blueprint_payload(parse_completion_payload(response, state, "Layout"))
+        slides = writer_output_json.get("slides", [])
+        parsed = select_layout_canvases(parsed, slides, state)
+        blueprint = PPTFinalBlueprint.model_validate(parsed)
+        if len(blueprint.canvases) != len(slides):
+            raise ContentConstraintError("Layout 返回的画布数量与输入页数不一致")
+        blueprint.schema_version = 2
+        blueprint.canvases = [bind_canvas(canvas, slide, preserve_component_style=writer_output_json.get('layout_policy',{}).get('allow_theme_change',False)) for canvas, slide in zip(blueprint.canvases, slides)]
+        for canvas in blueprint.canvases:
+            canvas.layout_resolved = False
+        return blueprint
 
     return design_layout

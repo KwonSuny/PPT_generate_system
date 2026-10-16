@@ -1,0 +1,44 @@
+# 运行期配置：含 DPAPI 加密后的 API Key 与个人模型服务地址
+config/config.json
+.runtime/
+PPT文件/
+*.pptx
+*.ppt
+*.pdf
+*.sqlite*
+*.db
+*.db-*
+output_images/
+output/
+outputs/
+*.log
+
+# Python 字节码与缓存
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 运行输出与 Agent 调试日志
+debug_logs/
+
+# 本地密钥与打包产物
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.zip
+*.tar.gz
+/github-release*/
+
+# 本地历史版本备份（不参与版本控制）
+clean/
+
+# 编辑器 / 系统杂项
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

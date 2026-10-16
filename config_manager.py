@@ -1,6 +1,7 @@
-
+# -*- coding: utf-8 -*-
 """应用配置与路径管理：API key 本地持久化 + 输出目录定位。
 
+安全说明：
 - API key 使用 Windows DPAPI（数据保护接口）加密后存储于 config/config.json，
   密文绑定当前 Windows 用户与机器：换账户、换机器、重装系统后无法解密，
   需重新输入一次。config.json 中不再出现明文 key。
@@ -9,13 +10,53 @@
 
 import base64
 import json
+import os
+import sys
 from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parent / "config"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# 保留句柄，避免 DLL 搜索目录在垃圾回收后失效。
+_CAIRO_DLL_HANDLES = {}
+
+
+class RenderDependencyError(RuntimeError):
+    pass
+
+
+def configure_cairo_runtime():
+    """仅调整当前进程；桌面启动不要求事先激活 conda。"""
+    if os.name != "nt":
+        return None
+    configured = os.environ.get("PPT_CAIRO_BIN", "").strip()
+    candidates = [configured] if configured else [
+        *os.environ.get("CAIROCFFI_DLL_DIRECTORIES", "").split(";"),
+        str(Path(sys.prefix) / "Library/bin"),
+        str(Path(sys.base_prefix) / "Library/bin"),
+        *([str(Path(os.environ["CONDA_PREFIX"]) / "Library/bin")] if os.environ.get("CONDA_PREFIX") else []),
+        *os.environ.get("PATH", "").split(os.pathsep),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        directory = Path(candidate).expanduser().resolve()
+        if not any((directory / name).is_file() for name in ("cairo.dll", "libcairo-2.dll")):
+            continue
+        name = str(directory)
+        if name not in _CAIRO_DLL_HANDLES and hasattr(os, "add_dll_directory"):
+            _CAIRO_DLL_HANDLES[name] = os.add_dll_directory(name)
+        # ctypes.find_library 仍通过 PATH 定位 DLL，加载依赖则需要上面的句柄。
+        paths = os.environ.get("PATH", "").split(os.pathsep)
+        os.environ["PATH"] = os.pathsep.join([name, *[item for item in paths if os.path.normcase(item) != os.path.normcase(name)]])
+        return name
+    if configured:
+        raise RenderDependencyError("PPT_CAIRO_BIN 指定的目录中缺少 Cairo DLL，请检查运行时配置")
+    return None
+
 # DPAPI 描述标识（非密钥，仅作用途标记）
 _DPAPI_DESC = "PPT Generator API Key"
+# CRYPTPROTECT_UI_FORBIDDEN：禁止弹出凭据提示，静默使用当前用户凭据
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
 try:
@@ -143,7 +184,8 @@ def save_base_url(url: str) -> None:
 
 
 def get_output_root() -> Path:
-    """PPT 输出根目录：固定锚定到项目目录下的 debug_logs 文件夹（绝对定位，不受启动 cwd 影响）。"""
-    out = Path(__file__).resolve().parent / "debug_logs"
+    """默认使用项目 debug_logs；Web 与 worker 可共同指定持久卷路径。"""
+    configured = os.environ.get("PPT_OUTPUT_ROOT", "").strip()
+    out = Path(configured).expanduser().resolve() if configured else Path(__file__).resolve().parent / "debug_logs"
     out.mkdir(parents=True, exist_ok=True)
     return out

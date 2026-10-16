@@ -22,6 +22,8 @@ class PPTGenerationState:
     requirement_history: List[str] = field(default_factory=list)
     history_snapshots: List[Dict[str, Any]] = field(default_factory=list)
     persistence_callback: Optional[Callable[["PPTGenerationState"], None]] = None
+    stage_executor: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    strict_persistence: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         self.data.setdefault("topic", self.topic)
@@ -36,15 +38,35 @@ class PPTGenerationState:
         self.data.setdefault("requirement_history", self.requirement_history)
         self.data.setdefault("history_snapshots", self.history_snapshots)
 
-    def bind_persistence(self, callback: Callable[["PPTGenerationState"], None]) -> None:
+    def bind_persistence(self, callback: Callable[["PPTGenerationState"], None], strict=False) -> None:
         self.persistence_callback = callback
+        self.strict_persistence = strict
+
+    @classmethod
+    def from_snapshot(cls, payload):
+        state = cls(topic=payload.get("topic", ""))
+        state.restore_snapshot(payload)
+        return state
+
+    def restore_snapshot(self, payload):
+        for name in ("topic", "requirements", "messages", "data", "feedback", "status", "progress_log",
+                     "last_updated", "operation_mode", "modify_scope", "modify_page", "modify_pages",
+                     "requirement_history", "history_snapshots"):
+            if name in payload:
+                setattr(self, name, payload[name])
+
+    def execute_stage(self, key, inputs, operation, model=None, result_model=None, external=True):
+        if self.stage_executor:
+            return self.stage_executor(key, inputs, operation, model, result_model, external)
+        return operation()
 
     def _persist(self) -> None:
         if self.persistence_callback is not None:
             try:
                 self.persistence_callback(self)
             except Exception as e:
-                # Guard against persistence errors (e.g., request-context access from background threads)
+                if self.strict_persistence:
+                    raise
                 print(f"[PPTGenerationState] Persistence callback raised: {e}")
 
     def append_message(self, role: str, content: str) -> None:
@@ -114,6 +136,7 @@ class PPTGenerationState:
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "topic": self.topic,
             "requirements": self.requirements,
+            "page_policy": self.get("page_policy"),
             "mode": self.operation_mode,
             "modify_page": self.modify_page,
             "modify_pages": self.modify_pages,
@@ -136,29 +159,9 @@ class PPTGenerationState:
     def should_use_incremental_mode(self) -> bool:
         return bool(self.get("outline")) or self.operation_mode != "new"
 
-    def build_messages(self, system_prompt: str, user_prompt: str) -> List[Dict[str, str]]:
-        full_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
-        full_messages.extend(self.messages)
-
-        context_payload = {
-            "topic": self.topic,
-            "requirements": self.requirements,
-            "operation_mode": self.operation_mode,
-            "modify_scope": self.modify_scope,
-            "modify_page": self.modify_page,
-            "modify_pages": self.modify_pages,
-            "requirement_history": self.requirement_history,
-            "feedback": self.feedback,
-            "current_outline": self.get("outline"),
-            "current_blueprint": self.get("blueprint"),
-        }
-        full_messages.append(
-            {
-                "role": "user",
-                "content": f"{user_prompt}\n\n=== 当前共享状态 ===\n{context_payload}",
-            }
-        )
-        return full_messages
+    def build_messages(self, system_prompt: str, user_prompt: str, role="writer") -> List[Dict[str, str]]:
+        from config.context import generation_messages
+        return generation_messages(self, system_prompt, user_prompt, role)
 
     def snapshot(self) -> Dict[str, Any]:
         return {

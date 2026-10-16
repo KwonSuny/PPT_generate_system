@@ -1,165 +1,103 @@
 import json
+from typing import Optional
+from pydantic import ValidationError
+from config.content import ContentConstraintError
 from config.schema import PPTOutline
-from config.sanitizers import normalize_outline_payload, parse_json_object
+from config.sanitizers import normalize_outline_payload, parse_completion_payload, model_to_dict
 from config.state import PPTGenerationState
-from config.llm_client import create_client, chat_completion_with_retry
+from config.llm_client import create_client, chat_completion_with_retry, resolve_model_name, model_request_options
 
 
-def get_writer_agent(api_key: str, model_name: str = "qwen3.7-max"):
-    """
-    创建并返回一个负责长文本扩写、精准图标指派与高级视觉元素补全的文案打磨智能体。
-    """
+def get_writer_agent(api_key: str, model_name: Optional[str] = None):
+    model_name = model_name or resolve_model_name("writer")
     client = create_client(api_key)
-    
-    def write_ppt_content(state: PPTGenerationState, planner_output_json: dict) -> PPTOutline:
-        print(" [Writer Agent] 收到大纲骨架，正在深入撰写长文本、分配微图标并规划视觉元素...")
-        
-        # 将 planner 的标准输出转化为字符串输入给模型
-        if isinstance(planner_output_json, dict):
-            input_str = json.dumps(planner_output_json, ensure_ascii=False, indent=2)
-        else:
-            input_str = str(planner_output_json)
-            
+
+    def write_ppt_content(state: PPTGenerationState, planner_output_json) -> PPTOutline:
+        skeleton = model_to_dict(planner_output_json)
         system_prompt = """
-        # ROLE
-        你是一个精通内容叙事与数字化视觉编排的顶级演示文稿架构师。
-        你的任务是：接棒 Planner 生成的高层大纲，将其深度扩写，并完美补全所有视觉与文本细节。
-
-        # TASK
-        输入是一个包含基本大纲和排版类型的 JSON 对象。你必须遍历其中的 `slides` 数组，保持原有的页面顺序、数量和基础字段（如 title, punchline, layout_type, theme）绝对不变，并【精准补全】以下核心高价值字段：
-        1. `full_content`: 根据 `bullet_points` 的大纲要点，扩写出详细的、极具宣讲说服力的文本段落。数量必须与 `bullet_points` 严格一一对应，字数控制在 120 字以内，严禁照抄 'bullet_points' 的原文。
-        2. `icons`: 为当前页面的每个 bullet 要点匹配一个最具现代化语境的 Lucide 图标库名称（例如：科技/算力用 'cpu'，安全/防御用 'shield'，数据/趋势用 'trending-up'，用户/团队用 'user'，全球化用 'globe'，高能/破局用 'rocket'）。图标数组的长度必须与 `bullet_points` 数量严格完全一致！
-        3. `svg_code`: 当且仅当 `layout_type == 'svg'` 时，在此处填入精美的、具备现代极简 UI/UX 设计感的矢量图形代码（包含高级流程图、系统架构图或结构化高颜值数据表格）。其他布局请设为 null。
-        4. `image_prompt`: 为当前页面提炼出一段适合生成现代高级演示文稿配图的中文视觉意境描述词。如果没有配图需求，请设为 null。
-        5. `image_path`: 统一保持为 null，由后面的物理生图智能体自动填充。
-
-        #  OUTPUT RULES (绝对合规红线) 
-        1. 必须输出一个且仅一个严格合法的标准 JSON 对象，其根结构必须是 `{"topic": "...", "slides": [...]}`。
-        2. `slides` 数组中的每一个元素必须是且只能是一个包含完整字段的 JSON 对象（{}），代表一页幻灯片。
-        3. 【绝对禁止】在 `slides` 数组中直接输出任何独立的字符串（如属性字段名 'image_path', 'icons', 'title' 等）！`slides` 数组里只能存在幻灯片对象，严禁夹带任何 schema 声明片段作为独立的数组元素！
-        4. 确保 JSON 语法绝对正确，不要有多余的逗号，不要提前闭合括号。
-
-        # SVG MODERN AESTHETIC RULES 
-        当绘制 `svg_code` 时，必须彻底丢弃传统的“工科死板方块连线”，全面实施以下现代化互联网高端 UI 设计规范：
-        1. **渐变色填充 (Gradients)**: 严禁使用任何纯单色填充！必须在 `<defs>` 区域内定义 `<linearGradient>` 或 `<radialGradient>`。例如设置多色锚点过渡（如从深邃色到亮炫色），并在形状的 `fill` 属性中使用 `url(#gradient_id)` 引用。
-        2. **柔和阴影与立体滤镜 (Drop Shadows & Blur)**: 必须为流程图的关键卡片、核心节点加上柔和的高斯模糊阴影滤镜，例如使用 `<filter id="soft-shadow">` 结合 `<feDropShadow dx="0" dy="4" stdDeviation="6" flood-opacity="0.08" flood-color="#000000"/>`，营造完美的悬浮层级感（Elevation）。
-        3. **顺滑曲线与圆角流 (Smooth Curves & Roundness)**: 所有的矩形卡片必须配合非常明显的平滑大圆角（`rx="16" ry="16"` 或 `rx="20" ry="20"`）。各节点之间的连接线严禁使用生硬的绝对直线或 90 度死板折线，必须使用三次贝塞尔曲线路径（如 `<path d="M... C..."/>`），使其具有水流般、生动的流线型导向。
-        4. **高级高颜值表格与对比矩阵规范 (Advanced SVG Tables)**:
-           - 若当前页面属于表格数据或指标对比维度场景，必须使用原生 SVG 标签精细构建完整的网格与文本。
-           - **表头美化**: 表头区域使用深色或显明的品牌主色调（如 `theme.primary`）作为背景矩形填充，文字显式加粗，颜色设为高对比浅色（如 `#FFFFFF`）。
-           - **数据行与斑马纹**: 数据行的背景必须使用交替轻微色区分（如纯白 `#FFFFFF` 与极其柔和的浅灰/浅蓝 `#F8FAFC` 互相交替）以建立杂志级透气感。行与行、列与列之间使用极细的浅色分割线（如 `stroke="#E2E8F0"`，`stroke-width="1"`）。
-           - **坐标微调与防重叠**: 每个单元格内的 `<text>` 标签必须精确分配唯一的 `x` 和 `y` 坐标，确保文本垂直水平完美居中或优雅左对齐。必须留足单元格内边距，绝对不能发生任何文字重叠、出格或中途被截断。
-        5. SVG 内所有文字必须留足内边距，不得贴边、溢出卡片或与连线/节点重叠。
-        # 结构完整性铁律（防止 Pydantic 校验失败的核心规则）
-        structural integrity rules 
-        你输出的 JSON 必须完美继承输入的所有骨架数据。对于 `slides` 数组中的每一页幻灯片，你必须：
-        1. **绝对原封不动地保留并复制** 输入中的 `title`、`punchline`、`bullet_points`、`layout_type` 和 `theme` 字段。严禁删除或遗漏它们！
-        2. 仅对原先为空的 `full_content`、`svg_code`、`image_prompt`、`image_path` 进行生成、扩写或保持 null。
-
-        # output format
-        1. 严禁在 SVG 内的 `<text>` 标签中使用 font-family="Arial" 或 font-family="sans-serif" 等不支持中文的纯英文字体！
-        2. 所有 `<text>` 标签必须统一显式指定支持中文的现代系统字体族：
-        font-family="'Microsoft YaHei', 'SimHei', 'PingFang SC'"
-        例如：`<text x="100" y="50" font-family="'Microsoft YaHei', 'SimHei', 'PingFang SC'" font-size="16" fill="#FFFFFF">核心原理解析</text>`
-        3. 确保文字的 x, y 坐标与字号（font-size）搭配合理，防止高分辨率渲染时由于中文字体较宽发生文字重叠。
-        4. `svg_code` 必须是完整、可被 XML 解析器解析的纯 SVG 字符串：必须包含 `<svg xmlns="[http://www.w3.org/2000/svg](http://www.w3.org/2000/svg)" viewBox="0 0 1280 720">`，禁止 Markdown 代码块围栏。
-        5. SVG 文本中的 XML 特殊字符必须转义：`&` 写成 `&amp;`，`<` 写成 `&lt;`，`>` 写成 `&gt;`。禁止出现未转义的裸 `&`。
-        6. 禁止使用 `<foreignObject>`、外链图片、外链字体、脚本、动画和任何需要联网加载的资源；所有视觉必须由 SVG 原生图形、路径、渐变、滤镜和文本完成。
-        
-        """
-
-        mode_hint = ""
+<role>
+你是演示文稿内容编辑与图解设计师，擅长把真实资料转化为有判断、有证据、可放进页面的文案与图示。
+</role>
+<task>
+你负责补全文案和结构化证据，输出一个合法 JSON 对象：schema_version=2、topic、slides。
+严格保留页数、顺序、页面 id、要点 bullet_ids，以及未授权的字段。文案面向观众，不写排版说明或泛泛口号。
+新生成时复制 title、punchline、bullet_points、layout_type、theme；补充 full_content、icons 和所需 table/diagram/svg_code。
+full_content 与要点对应，解释原因、过程、条件或证据，不重复标题凑字。普通页每条通常25–45字；有图示/表格且3条以上解释时优先15–28字，留出至少半页主视觉空间。以真实事实为先，不因字数建议删除已有数据或改变事实。结构化页面若无需外部解释可留 []，不得加入没有来源的数字或伪造引用。
+预算来自同页内容总量：标题、结论、要点标题、正文、图示都会占空间。避免每页同时写长结论、三条长标题和三段长正文。
+用户明确要求内联 SVG 表达时，生成与主题有关的 SVG 矢量插图或总览，写入适合页面的 svg_code，可与原生 table/diagram 共存；不得因为简单流程优先 diagram 就忽略 SVG 要求。仅允许 SVG 的指令不等于强制每页都使用 SVG。
+用户明确风格优先，其次识别主题用途，未明确时采用汇报风格。无须图片时 image_prompt=null；不要为了装饰耗用生图额度。
+图片用于独立插图区，不承载需要准确阅读的数据、文字或流程，image_path 由系统填充。
+</task>
+<native_components>
+表格使用 table，格式为：
+{"id":"table","columns":[{"id":"item","title":"项目"},{"id":"amount","title":"数值","format":{"style":"plain","decimals":2,"prefix":"","suffix":""}}],"rows":[{"id":"row-1","cells":[{"value":"原始项目"},{"value":12.5}]}],"source":"用户提供数据"}
+列、行 id 必须唯一；每行 cells 与列数一致。value 保留原始字符串或数值，禁止截断行列、改写精度、符号和单位。
+format.style 可为 plain、decimal、integer、percent；只有明确百分比时使用 percent（0.31 显示 31%）。数字字符串保持原样。
+若输入已有 table 的数据，不得改写数值或删除行列；缺少来源时 source=null，不能编造出处。
+简单关系图使用 diagram，格式为：
+{"id":"diagram","direction":"LR","nodes":[{"id":"input","label":"输入","shape_type":"rectangle"},{"id":"output","label":"输出","shape_type":"rectangle"}],"edges":[{"id":"edge-1","source":"input","target":"output","source_port":"auto","target_port":"auto","label":""}]}
+direction 为 LR 或 TB；节点与边 id 分别唯一。仅用于无环、连接相邻层的简单图；环路和复杂跨层拓扑使用 svg。
+shape_type 仅支持 rectangle、rounded_rectangle；圆柱、菱形等复杂图形使用 SVG。采用 SVG 表达完整流程时 diagram=null，不要输出 nodes=[] 的占位图。
+标签简洁；端口 auto 或与方向一致（LR 为 right/left，TB 为 bottom/top）。
+</native_components>
+<visual_design>
+根据当前主题色族设计 SVG 的线条、节点、强调与留白。采用不同视觉语法表达不同信息：时间线强调顺序，对照图强调差异，流程图强调关系；不为所有主题重复画等宽方框。
+SVG 用于复杂构图或用户明确要求的矢量表达：有效 xmlns="http://www.w3.org/2000/svg" 和正值 viewBox；宽高与构图一致，留足文字与连线间距。
+SVG最终通常只占半页到三分之二页。不要把小图置于800×400的大量空白中；viewBox应贴合完整绘制范围并保留少量安全边距。以800单位宽的图为例，重要标签优先24–32单位而非10–14，节点也随字增加，避免标签密集到无法在正文至少18pt的同一页容纳。
+SVG 不强制渐变/阴影/曲线；字体使用 Microsoft YaHei、SimHei；XML 特殊字符转义；不使用脚本、foreignObject 或外部资源。
+</visual_design>
+<output_check>
+仅输出本次输入的 slides，整套历史只用于理解，不得把其它页一起返回。检查要点与正文一一对应、图示可读、数据精度、字段与页数完整。只输出 JSON，不输出代码围栏。
+</output_check>
+"""
         if state.operation_mode == "incremental_page":
-            pages_desc = state.page_label()
-            if state.modify_scope == "design":
-                mode_hint = (
-                    f"本次为针对 {pages_desc} 的单页「仅设计」修改：只允许调整该页的设计风格——"
-                    "theme 的 primary/secondary/content/background 四个色值，以及 layout_type 版式。"
-                    "配色可参考输入中的 neighbor_themes 保持同一色彩家族连续演进。"
-                    "严禁修改 title、punchline、bullet_points、full_content 等任何文本字段。"
-                    "输出必须仍然是仅含 1 个元素的 slides 数组。"
-                )
-            else:
-                mode_hint = (
-                    f"本次为针对 {pages_desc} 的单页增量修改：输入 JSON 只包含该页内容。"
-                    "请依据用户最新要求更新该页的 title、punchline、bullet_points、full_content、image_prompt 等文本字段，"
-                    "theme 需与输入中的 neighbor_themes（邻页配色）保持同一色彩家族的连续演进。"
-                    "输出必须仍然是仅含 1 个元素的 slides 数组，严禁增删页面或输出多页。"
-                )
-        elif state.operation_mode == "continue":
-            mode_hint = "你将基于现有 PPT 内容继续优化，不要全量重写。"
-        elif state.operation_mode == "modify_text":
-            mode_hint = "请仅修改文本内容，保留原有版式与布局结构。"
-        elif state.operation_mode == "modify_design":
-            mode_hint = "请仅调整设计风格与视觉细节，不更改核心文案。"
-        if (
-            state.modify_page is not None
-            and state.operation_mode not in ("incremental_page",)
-        ):
-            mode_hint += f" 重点聚焦第 {state.modify_page} 页。"
-
-        state.append_progress("Writer: 补全文案与视觉细节")
-        response = chat_completion_with_retry(
-            client,
-            model=model_name,
-            messages=state.build_messages(
-                system_prompt,
-                f"{mode_hint}\n\n这是 Planner 规划出的初始大纲，请按照提示词补充相应字段，严格确保 slides 数组中只包含完整的幻灯片对象：\n\n{input_str}"
-            ),
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            extra_body={"enable_search": True, "enable_thinking": True},
-        )
-
-        if not hasattr(response, 'choices') or response.choices is None or len(response.choices) == 0:
-            print("\n [Writer Agent 崩溃警报] DashScope API 没有返回任何有效文本！")
-            raise ValueError("DashScope 接口返回了空 choices。")
-        
-        compiled_json = response.choices[0].message.content.strip()
-        state.append_message("assistant", compiled_json)
-        
-        try:
-            if compiled_json.startswith("```json"):
-                compiled_json = compiled_json.split("```json")[1].split("```")[0].strip()
-            elif compiled_json.startswith("```"):
-                compiled_json = compiled_json.split("```")[1].split("```")[0].strip()
-            
-            data = parse_json_object(compiled_json)
-            
-            if "slides" in data and isinstance(data["slides"], list):
-                clean_slides = [slide for slide in data["slides"] if isinstance(slide, dict)]
-                if len(clean_slides) != len(data["slides"]):
-                    data["slides"] = clean_slides 
-            
-            # 根据操作模式与修改范围决定字段级锁定策略：
-            #   - 增量（单页/多页/全局）：design 锁文字、text 锁版式、both 全解锁
-            #   - 全量（new/continue/回退）：锁骨架（structure），Writer 只扩写正文
-            if state.operation_mode == "incremental_page":
-                if state.modify_scope == "design":
-                    lock_scope = "design"
-                elif state.modify_scope == "text":
-                    lock_scope = "text"
-                else:
-                    lock_scope = None
-            else:
-                lock_scope = "structure"
-            normalized = normalize_outline_payload(
-                data,
-                skeleton=planner_output_json,
-                lock_scope=lock_scope,
+            scope = state.modify_scope
+            mode_hint = {
+                "text": "仅修改文本和表格单元格值/列标题/来源、节点与边标签。保持要点与段落数量、行列/节点/边的数量和 id 顺序。保留所有视觉、格式、关系、配图和 SVG 字段。内容长度应接近原文，以适合已固定的容器。",
+                "design": "仅修改 theme、layout_type、icons、image_prompt 等设计字段。本轮风格要求优先于旧版及邻页；要求更改背景/文字色时同步修改 theme.background/content/primary，不得只改说明而仍交回旧主题。允许同色族的深浅背景变体。所有 title、punchline、bullet_points、full_content、table 数据、diagram 关系/标签和 SVG 源码必须完全复制输入，不得改写任何数值。SVG 内部修改需使用页面修改。",
+                "both": "按照用户要求修改目标页的内容和设计。保留页面 id；要点数量不变时保留 bullet_ids，数量改变时分配不重复的 id。",
+            }.get(scope, "")
+            lock_scope = scope if scope in {"text", "design"} else None
+            mode_hint += "输入只有一页，输出严格一页。"
+        else:
+            lock_scope = "structure"
+            mode_hint = "补全输入骨架，严格保留页数、标题、要点、版式、配色和稳定 id。"
+        state.append_progress("Writer: 补全文案与结构化内容")
+        prompt = mode_hint + "\n" + json.dumps(skeleton, ensure_ascii=False)
+        for attempt in range(2):
+            response = chat_completion_with_retry(
+                client, model=model_name,
+                messages=state.build_messages(system_prompt, prompt),
+                response_format={"type": "json_object"},
+                **model_request_options('writer', model_name, search=True),
             )
-            outline = PPTOutline.model_validate(normalized)
-            state.set("outline", outline.model_dump())
-            return outline
-            
-        except Exception as e:
-            print(f"[Writer Agent] 结构自动清洗过程发生异常: {e}，将使用 Planner 骨架做保底回填...")
-            normalized = normalize_outline_payload(
-                {},
-                skeleton=planner_output_json,
-                lock_scope="structure",
-            )
-            outline = PPTOutline.model_validate(normalized)
+            data = parse_completion_payload(response, state, "Writer")
+            expected = [slide.get('id') for slide in skeleton.get('slides', [])]
+            returned = data.get('slides') if isinstance(data, dict) else None
+            if returned and all(isinstance(s, dict) and s.get('id') for s in returned) and all(expected):
+                ids = [s['id'] for s in returned]
+                if len(ids)!=len(set(ids)):
+                    raise ContentConstraintError('Writer 返回重复页面ID，页数与修改范围无法安全对应')
+                indexed = dict(zip(ids, returned))
+                if all(identity in indexed for identity in expected):
+                    if len(returned)!=len(expected):
+                        state.append_progress('Writer: 按稳定页面ID选取本次目标，忽略范围外页面')
+                    data = {**data, 'slides':[indexed[identity] for identity in expected]}
+            if not isinstance(data, dict) or not isinstance(data.get("slides"), list) or len(data["slides"]) != len(skeleton.get("slides", [])) or any(not isinstance(slide, dict) for slide in data["slides"]):
+                raise ContentConstraintError("Writer 输出页数或页面结构不符合输入；已停止修改")
+            try:
+                outline = PPTOutline.model_validate(normalize_outline_payload(data, skeleton=skeleton, lock_scope=lock_scope))
+            except (ValidationError, ContentConstraintError) as exc:
+                if attempt or lock_scope in {"text", "design"}:
+                    raise
+                state.append_progress("Writer: 完整响应未通过结构校验，执行一次格式修复")
+                prompt = (mode_hint + "\n原始骨架：" + json.dumps(skeleton, ensure_ascii=False) +
+                          "\n待修复的完整内容：" + json.dumps(data, ensure_ascii=False) +
+                          "\n校验错误：" + str(exc) +
+                          "\n只修复字段格式，保留全部文字、数据、节点标签与连接关系，不删除页面。"
+                          "若关系图含复杂图形或拓扑，将完整关系图转成 SVG，diagram=null；不得删减节点或连接以通过校验。"
+                          "输出完整 JSON。")
+                continue
             state.set("outline", outline.model_dump())
             return outline
 
