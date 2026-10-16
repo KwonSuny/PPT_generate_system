@@ -1,282 +1,67 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PPT 生成器</title>
-    <style>
-      :root { color-scheme: light; }
-      body {
-        font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-        margin: 0;
-        background: linear-gradient(135deg, #f8fbff 0%, #eef4ff 100%);
-        color: #102a43;
-      }
-      .container {
-        max-width: 860px;
-        margin: 0 auto;
-        padding: 48px 24px 72px;
-      }
-      .card {
-        background: white;
-        border-radius: 20px;
-        padding: 28px;
-        box-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
-      }
-      h1 { margin-top: 0; font-size: 28px; }
-      p { line-height: 1.7; color: #486581; }
-      label { display: block; font-weight: 600; margin-top: 16px; margin-bottom: 8px; }
-      input, textarea { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 12px; padding: 12px 14px; font-size: 15px; }
-      textarea { min-height: 120px; resize: vertical; }
-      button {
-        margin-top: 20px; border: none; background: linear-gradient(90deg, #2563eb, #4f46e5); color: white; padding: 12px 18px; border-radius: 999px; font-size: 15px; cursor: pointer;
-      }
-
-      .btn-secondary {
-        background: #f1f5f9;
-        color: #475569;
-        border: 1px solid #cbd5e1;
-        margin-left: 8px;
-        transition: all 0.2s ease;
-      }
-      .btn-secondary:hover {
-        background: #e2e8f0;
-        color: #1e293b;
-        border-color: #94a3b8;
-      }
-      .hint { font-size: 13px; color: #64748b; margin-top: 6px; }
-      .alert { margin-top: 16px; padding: 12px 14px; border-radius: 12px; background: #fee2e2; color: #991b1b; }
-      .success { background: #ecfdf3; color: #166534; }
-      .download-box { margin-top: 18px; padding: 14px; border-radius: 12px; background: #f8fafc; border: 1px solid #dbeafe; }
-      .preview-slide { margin-top: 10px; padding: 12px; border-radius: 12px; background: white; border: 1px solid #dbeafe; }
-      .preview-slide h4 { margin: 0 0 6px; font-size: 15px; }
-      .preview-slide p { margin: 0; font-size: 13px; color: #475569; }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <div class="card">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
-          <h1 style="margin-top: 0;">智能 PPT 生成器</h1>
-          <button type="button" class="btn-secondary" onclick="logoutKey()" style="margin-top: 0; white-space: nowrap;">注销 API Key</button>
-        </div>
-        <p>输入你的主题与要求，系统将为你生成可下载的 PowerPoint 文件。当前支持两种模式：配置 API Key 时走完整智能体链路；未配置时会生成离线演示版 PPT。</p>
-        <form method="post" action="/generate">
-          {% if has_previous_state %}
-            <div class="hint" style="margin-top: 0;">检测到已有生成历史，当前会话支持继续修改上一次 PPT。</div>
-          {% endif %}
-          <label for="topic">主题</label>
-          <input id="topic" name="topic" placeholder="例如：大语言模型的基本原理" required value="{{ state.topic if state else '' }}" />
-
-          <label for="requirements">要求</label>
-          <textarea id="requirements" name="requirements" placeholder="例如：请做成 3 页，强调应用场景和行业影响，并使用简洁科技风格。">{{ state.requirements if state else '' }}</textarea>
-
-          <label for="filename">文件名</label>
-          <input id="filename" name="filename" value="generated_presentation" placeholder="生成文件名（无需输入 .pptx）" />
-          <div class="hint">未配置 API Key 时，系统会自动生成一个离线演示版 PPT。</div>
-
-          <label for="mode">生成方式</label>
-          <select id="mode" name="mode" style="width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 12px; padding: 12px 14px; font-size: 15px;">
-            <option value="new"{% if state and state.operation_mode == 'new' %} selected{% endif %}>重新生成</option>
-            <option value="continue"{% if state and state.operation_mode == 'continue' %} selected{% endif %}>基于历史继续修改</option>
-            <option value="modify_text"{% if state and state.operation_mode == 'modify_text' %} selected{% endif %}>仅修改文本内容</option>
-            <option value="modify_design"{% if state and state.operation_mode == 'modify_design' %} selected{% endif %}>仅调整设计风格</option>
-          </select>
-
-          <label for="modify_page">指定页码（可选）</label>
-          <input id="modify_page" name="modify_page" placeholder="例如 2；或 2,3；或 2-4；或 1,3-5" value="{{ state.modify_page if state and state.modify_page is not none else '' }}" />
-          <div class="hint">选择“仅修改文本/设计”时：填页码改指定页（支持 2 / 2,3 / 2-4 / 1,3-5），留空则全局修改所有页。</div>
-
-
-          <div style="display: flex; gap: 4px;">
-            <button type="submit">生成 PPT</button>
-            <button type="button" class="btn-secondary" onclick="startNewChat()">新建对话</button>
-          </div>
-        </form>
-
-        {% if error %}
-          <div class="alert">{{ error }}</div>
-        {% endif %}
-
-        {% if success %}
-          <div class="alert success">已开始生成并自动保存到本地，下面会实时显示当前进度与 PPT 摘要预览。</div>
-          <div class="download-box">
-            <div>文件名：{{ file_name }}</div>
-            {% if save_path %}
-            <div style="margin-top: 6px; color: #334155;">保存路径：<span style="font-family: Consolas, monospace; font-size: 13px; word-break: break-all;">{{ save_path }}</span></div>
-            {% endif %}
-            <div style="margin-top: 6px; color: #475569;">本次模式：{{ mode_label }}</div>
-            <div id="current-status" style="margin-top: 8px; font-weight: 600; color: #2563eb;">等待开始...</div>
-            <div id="live-progress-summary" style="margin-top: 12px; color: #334155; font-size: 14px;">进度将在下方实时显示。</div>
-          </div>
-        {% endif %}
-
-        {% if success or state %}
-          <div class="card" style="margin-top: 20px; background: #f8fafc;">
-            <h2 style="font-size: 20px; margin-top: 0;">当前生成状态</h2>
-            {% if state.status %}
-              <p><strong>最新进度：</strong><span id="status-text">{{ state.status }}</span></p>
-            {% endif %}
-            {% if state.operation_mode %}
-              <p><strong>当前模式：</strong>{{ state.operation_mode }}</p>
-            {% endif %}
-            {% if state.modify_page %}
-              <p><strong>目标页码：</strong>{{ state.modify_page }}</p>
-            {% endif %}
-            {% if current_outline and current_outline.slides %}
-              <div style="margin-top: 16px;">
-                <strong>当前页面预览：</strong>
-                <ul style="margin: 10px 0 0 18px; color: #334155;">
-                  {% for slide in current_outline.slides %}
-                    <li><strong>{{ slide.title or '未命名' }}</strong>{% if slide.punchline %} — {{ slide.punchline }}{% endif %}</li>
-                  {% endfor %}
-                </ul>
-              </div>
-            {% endif %}
-            <div style="margin-top: 12px;">
-              <strong>进度日志：</strong>
-              <div id="progress-updated" style="margin-top: 6px; color: #64748b; font-size: 13px;">最近更新时间：<span id="last-updated">{{ state.last_updated or '暂无' }}</span></div>
-              <ol id="progress-log" style="margin: 10px 0 0 18px; color: #334155; max-height: 280px; overflow-y: auto; padding-right: 8px;">
-                {% for item in state.progress_log %}
-                  <li>{{ item }}</li>
-                {% endfor %}
-              </ol>
-            </div>
-            {% if state.requirement_history %}
-              <div style="margin-top: 16px;">
-                <strong>历史要求：</strong>
-                <ul style="margin: 10px 0 0 18px; color: #334155;">
-                  {% for req in state.requirement_history %}
-                    <li>{{ req }}</li>
-                  {% endfor %}
-                </ul>
-              </div>
-            {% endif %}
-            <div style="margin-top: 16px;">
-              <strong>PPT 预览：</strong>
-              <div id="ppt-preview" style="margin-top: 10px;"></div>
-            </div>
-            {% if state.history_snapshots %}
-              <div style="margin-top: 16px;">
-                <strong>历史快照：</strong>
-                <div style="margin-top: 10px;">
-                  {% for snapshot in state.history_snapshots[-3:] %}
-                    <div style="padding: 12px; margin-bottom: 10px; border-radius: 14px; background: #ffffff; border: 1px solid #dbeafe;">
-                      <div style="font-size: 14px; color: #0f172a;"><strong>{{ snapshot.timestamp }}</strong> · {{ snapshot.topic }}</div>
-                      <div style="font-size: 13px; color: #475569; margin-top: 4px;">模式：{{ {'new': '重新生成', 'continue': '基于历史继续修改', 'modify_text': '仅修改文本内容', 'modify_design': '仅调整设计风格', 'incremental_page': '增量修改'}.get(snapshot.mode, snapshot.mode) }}{% if snapshot.modify_pages %}，目标页：{{ snapshot.modify_pages | join('、') }}{% elif snapshot.modify_page %}，目标页：{{ snapshot.modify_page }}{% endif %}</div>
-                      <div style="font-size: 13px; color: #475569; margin-top: 4px;">要求：{{ snapshot.requirements or '无' }}</div>
-                      <div style="font-size: 13px; color: #475569; margin-top: 4px;">文件：{{ snapshot.file_name }}</div>
-                      {% if snapshot.slide_summary %}
-                        <div style="font-size: 13px; color: #334155; margin-top: 8px;"><strong>页面预览：</strong></div>
-                        <ul style="margin: 6px 0 0 18px; color: #334155;">
-                          {% for slide in snapshot.slide_summary %}
-                            <li><strong>{{ slide.title or '未命名' }}</strong> — {{ slide.punchline or '无摘要' }}</li>
-                          {% endfor %}
-                        </ul>
-                      {% endif %}
-                    </div>
-                  {% endfor %}
-                </div>
-              </div>
-            {% endif %}
-          </div>
-        {% endif %}
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPT 工作台</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='workbench.css') }}">
+</head>
+<body>
+<header class="app-top">
+  <div class="brand"><button class="mobile-library quiet" type="button" onclick="toggleLibrary()" aria-label="打开文稿列表">☰</button><span class="brand-mark"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="14" rx="1.5"/><path d="M8 22l4-4 4 4M7 9h10M7 13h6"/></svg></span>PPT 工作台</div>
+  <div class="top-actions"><span class="connection" id="model-connection">检查模型连接</span><a href="/setup">模型设置</a><button class="quiet" type="button" onclick="logoutKey()">清除本机密钥</button></div>
+</header>
+<div class="workbench">
+<aside class="library" id="library-panel" aria-label="文稿与版本">
+  <button class="new-doc" type="button" onclick="startNewChat()"><span aria-hidden="true">＋</span>新建文稿</button>
+  <section><h2 class="section-heading">我的文稿</h2><label for="conversation-picker">选择会话</label><select id="conversation-picker" onchange="chooseConversation()"><option value="">选择已有文稿</option>{% for conversation in conversations %}<option value="{{ conversation.id }}"{% if conversation.id == state.get('_conversation_id') %} selected{% endif %}>{{ conversation.title }}</option>{% endfor %}</select><div class="hint">讨论、生成和修改记录保存在同一会话中。</div></section>
+  <details open><summary>已保存版本与文件</summary><div id="version-list"><p class="hint">生成后可下载 PPT 与中间文件。</p></div></details>
+  <details><summary>旧归档</summary><button type="button" class="quiet" onclick="loadArchives()">扫描历史归档</button><div id="archive-list" class="archive-list" aria-live="polite"></div></details>
+  <div class="library-bottom hint">新建文稿保留已有历史。<br>文件导出成功后才保存为新版本。</div>
+</aside>
+<main class="document-area">
+  <header class="document-heading"><div><h1 id="workspace-title">{{ state.topic or '新文稿' }}</h1><div class="document-subtitle" id="document-subtitle">说明需求，或打开一份已保存的文稿</div></div><select class="version-picker" id="version-picker" aria-label="预览版本" onchange="chooseVersion(this.value)"><option value="">当前版本</option></select></header>
+  <div class="preview-toolbar"><div class="toolbar-group"><button type="button" id="prev-page" onclick="changePage(-1)" aria-label="上一页">‹</button><span class="page-counter" id="page-counter">暂无页面</span><button type="button" id="next-page" onclick="changePage(1)" aria-label="下一页">›</button><button type="button" id="expand-preview" onclick="expandPreview()">放大预览</button></div><label class="issue-toggle"><input id="show-issues" type="checkbox" onchange="drawActiveSlide()">显示审核标注</label></div>
+  <div id="readonly-notice" class="readonly-notice" hidden><span id="version-notice-text">正在查看历史版本。</span> <button class="quiet" type="button" onclick="reloadCurrentDocument()">重新打开当前文稿</button></div>
+  <div id="workbench-alert" class="alert" role="alert" hidden></div>
+  {% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}{% if success %}<div class="alert success" role="status">任务已保存，可在下方查看执行进度。</div>{% endif %}
+  <div class="preview-body"><nav id="page-strip" class="page-strip" aria-label="幻灯片页面"></nav><section id="ppt-preview" class="preview-stage" aria-label="成品预览"><div class="empty-stage"><div class="empty-icon" aria-hidden="true"></div><h2>从一个清晰的想法开始</h2><p>在右侧直接填写主题与要求，<br>或先和助手讨论受众、结构与内容。<br>生成后的每一页都可以单独预览和修改。</p></div></section></div>
+  <footer class="progress-panel"><div class="result-row"><p id="generation-result" role="status" aria-live="polite">等待生成或打开文稿</p><div class="result-actions"><a id="download-link" class="file-button" download hidden>下载当前 PPT</a><button id="retry-button" type="button" hidden onclick="retryCurrentJob()">重试本轮任务</button></div></div><details><summary>任务进度 <span id="status-text"></span></summary><div class="hint">更新时间：<span id="last-updated">{{ state.last_updated or '暂无' }}</span></div><ul id="progress-log"></ul></details></footer>
+</main>
+<aside class="controls" aria-label="文稿操作">
+  <div class="control-tabs" role="tablist"><button id="editor-tab" type="button" role="tab" aria-selected="true" aria-controls="editor-panel" onclick="switchPanel('editor')">生成 / 修改</button><button id="dialogue-tab" type="button" role="tab" aria-selected="false" aria-controls="dialogue-panel" onclick="switchPanel('dialogue')">讨论 / 提问</button><button id="design-tab" type="button" role="tab" aria-selected="false" aria-controls="design-panel" onclick="switchPanel('design')">设计候选</button></div>
+  <section class="control-panel" id="editor-panel" role="tabpanel" aria-labelledby="editor-tab">
+    <form class="editor-form" id="generation-form" data-job-id="{{ state.get('_job_id') or '' }}" method="post" action="/generate">
+      <input type="hidden" name="request_id" value="{{ request_id }}"><input type="hidden" id="conversation-id" name="conversation_id" value="{{ state.get('_conversation_id') or '' }}"><input type="hidden" id="base-version-id" name="base_version_id" value="{{ state.get('_version_id') or '' }}">
+      <div class="form-fields">
+        <label for="mode">操作</label>{% set display_mode = form_values.mode %}<select id="mode" name="mode" onchange="updateEditorMode()"><option value="new"{% if display_mode == 'new' %} selected{% endif %}>生成新文稿</option><option value="continue"{% if display_mode == 'continue' %} selected{% endif %}>修改内容与设计</option><option value="modify_text"{% if display_mode == 'modify_text' %} selected{% endif %}>仅修改文字</option><option value="modify_design"{% if display_mode == 'modify_design' %} selected{% endif %}>仅修改设计</option></select>
+        <label for="topic">主题</label><input id="topic" name="topic" required placeholder="例如：咖啡从种植到杯中的旅程" value="{{ form_values.topic }}">
+        <label for="requirements">内容与要求</label><textarea id="requirements" name="requirements" placeholder="说明受众、重点、风格和资料。也可以先到“讨论 / 提问”中一起完善。">{{ form_values.requirements }}</textarea>
+        <div class="field-row"><div id="page-range-field"><label for="page_range">总页数 / 范围</label><input id="page_range" name="page_range" value="{{ form_values.page_range }}" placeholder="默认 2–5"></div><div><label for="filename">文件名</label><input id="filename" name="filename" value="{{ form_values.filename }}" placeholder="无需 .pptx"></div></div>
+        <div id="new-mode-hint" class="hint">页数包含封面，支持 1–50 页；未明确风格时优先汇报。</div>
+        <div id="modify-fields" hidden><label for="modify_page">修改页码</label><input id="modify_page" name="modify_page" placeholder="例如 2、2-4 或 1,3" value="{{ form_values.modify_page }}"><button class="current-page-action" type="button" onclick="useCurrentPage()">使用当前预览页</button><div class="hint" id="modify-hint">勾选左侧缩略图也可选择多页。留空会修改全部页面。</div></div>
       </div>
-    </div>
-    <script>
-      function renderPreview(preview) {
-        const container = document.getElementById('ppt-preview');
-        if (!container) return;
-        if (!preview || !preview.length) {
-          container.innerHTML = '<div class="hint">生成完成后会在这里显示 PPT 页面预览。</div>';
-          return;
-        }
-        container.innerHTML = preview.map((slide, idx) => `
-          <div class="preview-slide">
-            <h4>${idx + 1}. ${slide.title || '未命名页'}</h4>
-            <p>${slide.text || '暂无正文内容'}</p>
-          </div>
-        `).join('');
-      }
-
-      async function refreshState() {
-        try {
-          const response = await fetch('/state');
-          if (!response.ok) return;
-          const data = await response.json();
-          const statusEl = document.getElementById('status-text');
-          const currentStatusEl = document.getElementById('current-status');
-          const lastUpdatedEl = document.getElementById('last-updated');
-          const progressSummaryEl = document.getElementById('live-progress-summary');
-          const logEl = document.getElementById('progress-log');
-
-          const statusText = data.status || '等待开始...';
-          if (statusEl) {
-            statusEl.textContent = statusText;
-          }
-          if (currentStatusEl) {
-            currentStatusEl.textContent = statusText;
-          }
-          if (lastUpdatedEl) {
-            lastUpdatedEl.textContent = data.last_updated || '暂无';
-          }
-          if (progressSummaryEl) {
-            progressSummaryEl.textContent = data.progress_log && data.progress_log.length
-              ? `共 ${data.progress_log.length} 条日志，最后更新时间：${data.last_updated || '暂无'}`
-              : '生成进度将在此处实时显示。';
-          }
-          if (logEl) {
-            logEl.innerHTML = (data.progress_log || []).map(item => `<li>${item}</li>`).join('');
-          }
-          renderPreview(data.preview || []);
-        } catch (err) {
-          console.error(err);
-        }
-      }
-
-
-      async function startNewChat() {
-        if (!confirm('确定要清空当前历史并开始新对话吗？')) {
-          return;
-        }
-        try {
-          const response = await fetch('/api/reset', { method: 'POST' });
-          const data = await response.json();
-          if (data.status === 'success') {
-            // 重置成功，直接刷新页面回到最初的纯净状态
-            window.location.href = '/';
-          } else {
-            alert('重置失败: ' + (data.message || '未知错误'));
-          }
-        } catch (err) {
-          console.error(err);
-          alert('请求失败，请检查后端服务是否正常运行。');
-        }
-      }
-
-
-      async function logoutKey() {
-        if (!confirm('确定要注销当前 API Key 并返回设置页吗？')) {
-          return;
-        }
-        try {
-          const response = await fetch('/api/logout', { method: 'POST' });
-          const data = await response.json();
-          if (data.status === 'success') {
-            window.location.href = '/setup';
-          } else {
-            alert('注销失败: ' + (data.message || '未知错误'));
-          }
-        } catch (err) {
-          console.error(err);
-          alert('请求失败，请检查后端服务是否正常运行。');
-        }
-      }
-
-      window.addEventListener('DOMContentLoaded', () => {
-        refreshState();
-        setInterval(refreshState, 2000);
-      });
-    </script>
-  </body>
+      <div class="form-actions"><div class="scope-summary" id="scope-summary">新文稿默认 2–5 页</div><button class="primary" id="generate-button" type="submit"{% if state.get('generation_status') in ['queued', 'running'] %} disabled{% endif %}>生成 PPT</button></div>
+    </form>
+  </section>
+  <section class="control-panel" id="dialogue-panel" role="tabpanel" aria-labelledby="dialogue-tab" hidden>
+    <div class="chat-settings"><select id="chat-intent" aria-label="对话方式" onchange="updateChatMode()"><option value="discuss">讨论需求</option><option value="question">提问 PPT 内容</option></select><select id="chat-scope" aria-label="提问页面范围"><option value="all">整份文稿</option><option value="page">当前预览页</option></select></div>
+    <div class="chat-messages" id="chat-messages"><div class="chat-empty">告诉助手你想向谁讲述什么。已有 PPT 时，可以切换到“提问 PPT 内容”，回答会附上页码与证据。</div></div>
+    <div class="chat-status" id="chat-status" role="status" aria-live="polite"></div>
+    <form class="chat-composer" id="chat-form"><label class="section-heading" for="chat-input">消息</label><textarea id="chat-input" placeholder="例如：希望向新员工介绍咖啡的完整加工流程，4 页，不生图。" maxlength="8000" required></textarea><div class="composer-bottom"><span class="hint" id="chat-mode-hint">讨论可以形成可应用的生成计划。</span><button class="primary" id="chat-send" type="submit">发送</button></div></form>
+  </section>
+  <section class="control-panel design-panel" id="design-panel" role="tabpanel" aria-labelledby="design-tab" hidden>
+    <div class="design-intro"><h2>同一内容，两种构图</h2><p>与原版并排比较，再采用合适的设计。生成候选会保留当前文稿。</p></div>
+    <label for="design-pages">目标页码</label><input id="design-pages" placeholder="留空使用当前预览页"><button class="quiet" type="button" onclick="useDesignSelection()">使用已勾选的页面</button>
+    <p class="hint" id="design-scope">先打开已保存文稿。</p>
+    <label for="design-request">本轮设计要求</label><textarea id="design-request" maxlength="2000" placeholder="例如：使用咖啡流程对应的本地图标，突出关键数据，避免重复卡片。"></textarea>
+    <p class="hint">保留原文字、数据和 SVG；明确要求时可调整主题色及字号，正文默认至少18pt。两个候选最多处理3页，不生图。</p>
+    <button id="design-generate" class="primary" type="button" onclick="generateDesignCandidates()">生成两个设计候选</button><p id="design-status" role="status" aria-live="polite"></p><div id="design-list"></div>
+  </section>
+</aside>
+</div>
+<dialog class="preview-dialog" id="preview-dialog"><header><span id="expanded-title">页面预览</span><button type="button" onclick="document.getElementById('preview-dialog').close()">关闭</button></header><img id="expanded-image" alt="幻灯片放大预览"></dialog>
+<dialog class="design-dialog" id="design-dialog"><header><div><h2>设计候选比较</h2><p>采用候选会更新所有选中页；其它页保持原样，旧版本仍保留。</p></div><button type="button" onclick="document.getElementById('design-dialog').close()">关闭</button></header><p id="design-dialog-alert" class="alert" role="alert" hidden></p><nav><button id="design-prev" type="button" onclick="stepDesignPage(-1)">上一目标页</button><span id="design-compare-page"></span><button id="design-next" type="button" onclick="stepDesignPage(1)">下一目标页</button></nav><div class="design-compare-grid" id="design-compare-grid"></div></dialog>
+<script src="{{ url_for('static', filename='workbench.js') }}"></script>
+<script src="{{ url_for('static', filename='design.js') }}"></script>
+</body>
 </html>

@@ -5,15 +5,17 @@ import requests
 import dashscope
 from dashscope import MultiModalConversation
 from typing import Optional
-from config.llm_client import create_client, chat_completion_with_retry
+from config.llm_client import resolve_model_name, guard_model_request, record_model_response
 
-def get_image_generator(api_key: str, model_name: str = "qwen-image-2.0-pro-2026-04-22"):
+def get_image_generator(api_key: str, model_name: Optional[str] = None):
     """
     创建并返回一个深度适配 PPT 生成管线的高端多模态图像生成智能体。
     """
-    client = create_client(api_key)
-    dashscope.api_key = client.api_key
-    dashscope.base_http_api_url = client.base_url
+    model_name = model_name or resolve_model_name("image")
+    dashscope.api_key = api_key
+    # 发布源码不绑定个人工作空间；生图使用 DashScope 原生协议地址。
+    dashscope.base_http_api_url = (os.environ.get("DASHSCOPE_IMAGE_BASE_URL", "").strip()
+                                   or "https://dashscope.aliyuncs.com/api/v1")
 
     def generate_and_save_image(
         prompt: str, 
@@ -63,6 +65,7 @@ def get_image_generator(api_key: str, model_name: str = "qwen-image-2.0-pro-2026
         dashscope_size = size.replace("x", "*")
 
         try:
+            guard_model_request()
             response = MultiModalConversation.call(
                 model=model_name,
                 messages=messages,
@@ -73,6 +76,7 @@ def get_image_generator(api_key: str, model_name: str = "qwen-image-2.0-pro-2026
                 negative_prompt="低分辨率，低画质，肢体畸形，画面过饱和，无质感，低级AI感，扭曲，不合常理的排版，杂乱标签。",
                 size=dashscope_size
             )
+            record_model_response(model_name, getattr(response, "usage", None), getattr(response, "request_id", None))
 
             # 6. 状态校验与响应解析
             if response.status_code == 200:
@@ -97,8 +101,17 @@ def get_image_generator(api_key: str, model_name: str = "qwen-image-2.0-pro-2026
                 print(f"[Image Agent] 云端渲染完成，正在拉取二进制图元数据...")
                 img_response = requests.get(img_url, timeout=20)
                 if img_response.status_code == 200:
-                    with open(file_path, "wb") as f:
-                        f.write(img_response.content)
+                    from uuid import uuid4
+                    temporary = f"{file_path}.{uuid4().hex}.tmp"
+                    try:
+                        with open(temporary, "wb") as f:
+                            f.write(img_response.content)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(temporary, file_path)
+                    finally:
+                        if os.path.exists(temporary):
+                            os.unlink(temporary)
                     
                     absolute_path = os.path.abspath(file_path)
                     print(f" [Image Agent] 图元成功离线化并写入上下文：{absolute_path}")

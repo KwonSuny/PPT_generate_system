@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>初始化 · PPT 生成器</title>
+  <title>初始化 · PPT 工作台</title>
   <style>
     :root {
-      --brand: #2563eb;
+      --brand: #345bd9;
       --brand-deep: #1e40af;
       --ink: #0f172a;
       --muted: #64748b;
@@ -27,7 +27,7 @@
     }
     .card {
       background: var(--card);
-      border-radius: 20px;
+      border-radius: 12px;
       box-shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
       display: grid;
       grid-template-columns: 320px 1fr;
@@ -36,7 +36,7 @@
       width: 100%;
     }
     .brand {
-      background: linear-gradient(160deg, #1d4ed8 0%, #3b82f6 55%, #60a5fa 100%);
+      background: #345bd9;
       color: #fff;
       padding: 40px 32px;
       display: flex;
@@ -106,15 +106,15 @@
             <path d="M8 12h8M12 8v8"></path>
           </svg>
         </div>
-        <h1>PPT 生成器</h1>
+        <h1>PPT 工作台</h1>
         <p class="slogan">基于多智能体协作的一键演示文稿生成与精细化编辑工具</p>
       </div>
-      <div class="foot">Planner · Writer · Layout 三 Agent 架构</div>
+      <div class="foot">讨论需求、生成页面、持续修改</div>
     </aside>
 
     <div class="form">
       <h2>连接你的模型服务</h2>
-      <p class="desc">首次使用需配置 DashScope API Key，用于驱动内容规划、文案撰写与视觉排版智能体。密钥仅以加密形式保存在本机，不会上传。</p>
+      <p class="desc">首次使用需配置 DashScope API Key，用于驱动内容规划、文案撰写与视觉排版智能体。密钥以加密形式保存在本机，调用模型时用于连接服务。</p>
 
       <label for="apikey">DashScope API Key</label>
       <div class="row">
@@ -133,7 +133,7 @@
       </div>
 
       <p class="hint">
-        还没有密钥？前往 <a href="#">阿里云百炼控制台</a> 创建 API Key。
+        还没有密钥？前往 <a href="https://bailian.console.aliyun.com/" target="_blank" rel="noopener noreferrer">阿里云百炼控制台</a> 创建 API Key。
         密钥使用 Windows 数据保护（DPAPI）加密后保存在项目目录的 <code>config/config.json</code>，仅本机本账户可解密；换账户或换机器后需重新输入。
       </p>
     </div>
